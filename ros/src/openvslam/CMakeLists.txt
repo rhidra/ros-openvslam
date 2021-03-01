@@ -130,6 +130,12 @@ find_package(catkin REQUIRED COMPONENTS
         cv_bridge
         image_transport)
 
+# Point Cloud Library
+find_package(PCL 1.3 REQUIRED)
+include_directories(${PCL_INCLUDE_DIRS})
+link_directories(${PCL_LIBRARY_DIRS})
+add_definitions(${PCL_DEFINITIONS})
+
 # thread library
 find_package(Threads REQUIRED)
 

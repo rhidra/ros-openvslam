@@ -20,6 +20,22 @@
 #include <spdlog/spdlog.h>
 #include <popl.hpp>
 
+#include <opencv2/core/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <spdlog/spdlog.h>
+#include <popl.hpp>
+#include "openvslam/data/landmark.h"
+#include "openvslam/data/keyframe.h"
+#include "openvslam/data/map_database.h"
+#include "openvslam/publish/map_publisher.h"
+
+#include <geometry_msgs/PoseStamped.h>
+#include <nav_msgs/Odometry.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/transform_broadcaster.h>
+
 #ifdef USE_STACK_TRACE_LOGGER
 #include <glog/logging.h>
 #endif
@@ -50,8 +66,10 @@ void mono_tracking(const std::shared_ptr<openvslam::config>& cfg, const std::str
     const auto tp_0 = std::chrono::steady_clock::now();
 
     // initialize this node
-    const ros::NodeHandle nh;
+    ros::NodeHandle nh;
     image_transport::ImageTransport it(nh);
+    ros::Publisher point_cloud_publisher = nh.advertise<sensor_msgs::PointCloud2>("/openvslam/point_cloud", 1);
+    ros::Publisher pose_publisher = nh.advertise<geometry_msgs::PoseStamped>("/openvslam/camera_pose", 1);
 
     // run the SLAM as subscriber
     image_transport::Subscriber sub = it.subscribe("camera/image_raw", 1, [&](const sensor_msgs::ImageConstPtr& msg) {
@@ -59,12 +77,60 @@ void mono_tracking(const std::shared_ptr<openvslam::config>& cfg, const std::str
         const auto timestamp = std::chrono::duration_cast<std::chrono::duration<double>>(tp_1 - tp_0).count();
 
         // input the current frame and estimate the camera pose
-        SLAM.feed_monocular_frame(cv_bridge::toCvShare(msg, "bgr8")->image, timestamp, mask);
+        auto cam_pose = SLAM.feed_monocular_frame(cv_bridge::toCvShare(msg, "bgr8")->image, timestamp, mask);
 
         const auto tp_2 = std::chrono::steady_clock::now();
 
         const auto track_time = std::chrono::duration_cast<std::chrono::duration<double>>(tp_2 - tp_1).count();
         track_times.push_back(track_time);
+
+
+        std::vector<openvslam::data::landmark*> all_landmarks;
+        std::set<openvslam::data::landmark*> local_landmarks;
+        SLAM.get_map_publisher()->get_landmarks(all_landmarks, local_landmarks);
+        pcl::PointCloud<pcl::PointXYZ> cloud_;
+
+        for (const auto& lm: all_landmarks) {
+          auto pos = lm->get_pos_in_world();
+          auto pt = pcl::PointXYZ();
+          pt.x = pos(2);
+          pt.y = -pos(0);
+          pt.z = pos(1);
+          cloud_.points.push_back(pt);
+        }
+        auto pc2_msg_ = sensor_msgs::PointCloud2();
+        pcl::toROSMsg(cloud_, pc2_msg_);
+        pc2_msg_.header.frame_id = "map";
+        point_cloud_publisher.publish(pc2_msg_);
+
+        // Create pose message and update it with current camera pose
+        Eigen::Matrix3d rotation_matrix = cam_pose.block(0, 0, 3, 3);
+        Eigen::Vector3d translation_vector = cam_pose.block(0, 3, 3, 1);
+        tf2::Matrix3x3 tf_rotation_matrix(rotation_matrix(0, 0), rotation_matrix(0, 1), rotation_matrix(0, 2),
+                                          rotation_matrix(1, 0), rotation_matrix(1, 1), rotation_matrix(1, 2),
+                                          rotation_matrix(2, 0), rotation_matrix(2, 1), rotation_matrix(2, 2));
+        tf2::Vector3 tf_translation_vector(translation_vector(0), translation_vector(1), translation_vector(2));
+        tf_rotation_matrix = tf_rotation_matrix.inverse();
+        tf_translation_vector = -(tf_rotation_matrix * tf_translation_vector);
+        tf2::Transform transform_tf(tf_rotation_matrix, tf_translation_vector);
+        tf2::Matrix3x3 rot_open_to_ros (0, 0, 1,
+                                      -1, 0, 0,
+                                      0,-1, 0);
+        tf2::Transform transformA(rot_open_to_ros, tf2::Vector3(0.0, 0.0, 0.0));
+        tf2::Transform transformB(rot_open_to_ros.inverse(), tf2::Vector3(0.0, 0.0, 0.0));
+        transform_tf = transformA * transform_tf * transformB;
+        ros::Time now = ros::Time::now();
+        geometry_msgs::PoseStamped camera_pose_msg_;
+        camera_pose_msg_.header.stamp = now;
+        camera_pose_msg_.header.frame_id = "map";
+        camera_pose_msg_.pose.position.x = transform_tf.getOrigin().getX();
+        camera_pose_msg_.pose.position.y = transform_tf.getOrigin().getY();
+        camera_pose_msg_.pose.position.z = transform_tf.getOrigin().getZ();
+        camera_pose_msg_.pose.orientation.x = transform_tf.getRotation().getX();
+        camera_pose_msg_.pose.orientation.y = transform_tf.getRotation().getY();
+        camera_pose_msg_.pose.orientation.z = transform_tf.getRotation().getZ();
+        camera_pose_msg_.pose.orientation.w = transform_tf.getRotation().getW();
+        pose_publisher.publish(camera_pose_msg_);
     });
 
     // run the viewer in another thread
